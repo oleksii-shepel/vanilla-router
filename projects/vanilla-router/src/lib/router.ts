@@ -1,10 +1,11 @@
 export interface Route {
   path: string;
-  loadComponent?: () => Promise<any>; // Component to render
-  loadChildren?: () => Promise<any>; // NgModule to load
-  redirectTo?: string; // Redirect path
-  pathMatch?: 'full' | 'prefix'; // Match strategy
-  data?: Record<string, any>; // Data specific to the route
+  loadComponent?: () => Promise<any>;
+  loadChildren?: () => Promise<any>;
+  redirectTo?: string;
+  pathMatch?: 'full' | 'prefix';
+  data?: Record<string, any>;
+  children?: Route[]; // Support for nested routes
 }
 
 export interface RouterConfig {
@@ -78,7 +79,7 @@ export class Router {
     this.currentPath = pathname;
     this.currentQuery = query;
 
-    const route = this._findMatchingRoute(pathname);
+    const route = this._findMatchingRoute(this.routes, pathname);
 
     if (route) {
       // Prepare the ActivatedRoute object with the route data
@@ -136,8 +137,8 @@ export class Router {
     );
   }
 
-  private _findMatchingRoute(pathname: string): Route | null {
-    for (const route of this.routes) {
+  private _findMatchingRoute(routes: Route[], pathname: string): Route | null {
+    for (const route of routes) {
       if (route.path === pathname) {
         return route;
       }
@@ -171,6 +172,12 @@ export class Router {
 
       if (isMatch) {
         this.currentParams = params;
+        if (route.children) {
+          const childRoute = this._findMatchingRoute(route.children, pathname);
+          if (childRoute) {
+            return childRoute;
+          }
+        }
         return route;
       }
     }
@@ -246,6 +253,12 @@ const routes: Route[] = [
   {
     path: '/about',
     loadComponent: () => import('./about-component'),
+    children: [
+      {
+        path: 'team',
+        loadComponent: () => import('./team-component'),
+      },
+    ],
   },
   {
     path: '/users/:id',
@@ -270,6 +283,8 @@ const nav = document.createElement('nav');
 nav.appendChild(router.createLink('/', 'Home'));
 nav.appendChild(document.createTextNode(' | '));
 nav.appendChild(router.createLink('/about', 'About'));
+nav.appendChild(document.createTextNode(' | '));
+nav.appendChild(router.createLink('/about/team', 'Team'));
 nav.appendChild(document.createTextNode(' | '));
 nav.appendChild(router.createLink('/users/123', 'User Profile'));
 
