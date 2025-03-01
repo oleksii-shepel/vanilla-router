@@ -1,23 +1,11 @@
-import {
-  NgModuleRef,
-  ApplicationRef,
-  Injector,
-  Type,
-  ComponentRef,
-  createComponent,
-  EnvironmentInjector,
-} from '@angular/core';
-
 export interface Route {
   path: string;
-  loadComponent?: () => Promise<Type<any>>; // For Angular components
-  loadChildren?: () => Promise<NgModuleRef<any>>; // For Angular modules
+  loadComponent?: () => Promise<any>;
+  loadChildren?: () => Promise<any>;
   redirectTo?: string;
   pathMatch?: 'full' | 'prefix';
   data?: Record<string, any>;
   children?: Route[]; // Support for nested routes
-  canActivate?: CanActivate[]; // Route guards
-  resolve?: Record<string, Resolve<any>>; // Resolvers
 }
 
 export interface RouterConfig {
@@ -33,32 +21,17 @@ export interface ActivatedRoute {
   data?: Record<string, any>; // Data associated with the route
 }
 
-export interface CanActivate {
-  canActivate(route: ActivatedRoute): boolean | Promise<boolean>;
-}
-
-export interface Resolve<T> {
-  resolve(route: ActivatedRoute): T | Promise<T>;
-}
-
 export class Router {
   private routes: Route[] = [];
   private currentParams: Record<string, string> = {};
   private rootElement: HTMLElement | null;
   private enableTracing: boolean;
-  private currentComponentRef: ComponentRef<any> | null = null;
-  private currentModuleRef: NgModuleRef<any> | null = null;
 
   // Expose current path and query as public properties
   public currentPath: string = '';
   public currentQuery: Record<string, string> = {};
 
-  constructor(
-    config: RouterConfig,
-    private appRef: ApplicationRef,
-    private injector: Injector,
-    private environmentInjector: EnvironmentInjector
-  ) {
+  constructor(config: RouterConfig) {
     this.routes = config.routes;
     this.rootElement = config.rootElement || document.getElementById('app');
     this.enableTracing = config.enableTracing || false;
@@ -70,7 +43,6 @@ export class Router {
     this._navigateToCurrentUrl();
   }
 
-  // Navigate to a new path
   navigate(path: string, replace: boolean = false): void {
     if (this.enableTracing) {
       console.log(`Navigating to: ${path}`);
@@ -81,12 +53,10 @@ export class Router {
     this._handleRouting(path);
   }
 
-  // Start the router
   start(): void {
     this._navigateToCurrentUrl();
   }
 
-  // Create a link element
   createLink(to: string, text: string, className: string = ''): HTMLAnchorElement {
     const link = document.createElement('a');
     link.href = to;
@@ -103,7 +73,6 @@ export class Router {
     return link;
   }
 
-  // Handle routing logic
   private async _handleRouting(path: string): Promise<void> {
     const { pathname, params, query } = this._parsePath(path);
     this.currentParams = params;
@@ -113,46 +82,12 @@ export class Router {
     const route = this._findMatchingRoute(this.routes, pathname);
 
     if (route) {
-      // Check route guards
-      if (route.canActivate) {
-        const canActivateResults = await Promise.all(
-          route.canActivate.map((guard) =>
-            guard.canActivate({
-              params: this.currentParams,
-              queryParams: this.currentQuery,
-              path: this.currentPath,
-              data: route.data,
-            })
-          )
-        );
-
-        if (canActivateResults.some((result) => !result)) {
-          // If any guard returns false, block navigation
-          return;
-        }
-      }
-
-      // Resolve data
-      const resolvedData: Record<string, any> = {};
-      if (route.resolve) {
-        await Promise.all(
-          Object.entries(route.resolve).map(async ([key, resolver]) => {
-            resolvedData[key] = await resolver.resolve({
-              params: this.currentParams,
-              queryParams: this.currentQuery,
-              path: this.currentPath,
-              data: route.data,
-            });
-          })
-        );
-      }
-
       // Prepare the ActivatedRoute object with the route data
       const activatedRoute: ActivatedRoute = {
         params: this.currentParams,
         queryParams: this.currentQuery,
         path: this.currentPath,
-        data: { ...route.data, ...resolvedData }, // Merge route data with resolved data
+        data: route.data, // Include the route-specific data
       };
 
       if (route.redirectTo) {
@@ -160,33 +95,32 @@ export class Router {
         return;
       }
 
-      // Handle Angular module loading
+      // Handle module loading
       if (route.loadChildren) {
         try {
           const module = await route.loadChildren();
-          this.currentModuleRef = module;
-
-          // Bootstrap the Angular module
-          const component = module.instance.ngDoBootstrap();
-          if (component) {
-            this._renderAngularComponent(component);
+          const component = module.default || module;
+          if (this.rootElement) {
+            this.rootElement.innerHTML = '';
+            this.rootElement.appendChild(component(activatedRoute)); // Pass activatedRoute data to component
           }
         } catch (error) {
-          console.error('Failed to load Angular module:', error);
           if (this.rootElement) {
-            this.rootElement.innerHTML = '<h1>Angular module failed to load</h1>';
+            this.rootElement.innerHTML = '<h1>Module failed to load</h1>';
           }
         }
       }
-      // Handle Angular component loading
+      // Handle component loading
       else if (route.loadComponent) {
         try {
           const component = await route.loadComponent();
-          this._renderAngularComponent(component);
-        } catch (error) {
-          console.error('Failed to load Angular component:', error);
           if (this.rootElement) {
-            this.rootElement.innerHTML = '<h1>Angular component failed to load</h1>';
+            this.rootElement.innerHTML = '';
+            this.rootElement.appendChild(component(activatedRoute)); // Pass activatedRoute data to component
+          }
+        } catch (error) {
+          if (this.rootElement) {
+            this.rootElement.innerHTML = '<h1>Component failed to load</h1>';
           }
         }
       }
@@ -203,24 +137,6 @@ export class Router {
     );
   }
 
-  // Render an Angular component
-  private _renderAngularComponent(component: Type<any>): void {
-    if (this.currentComponentRef) {
-      this.currentComponentRef.destroy(); // Clean up the previous component
-    }
-
-    // Create the component dynamically
-    this.currentComponentRef = createComponent(component, {
-      environmentInjector: this.environmentInjector,
-    });
-
-    if (this.rootElement) {
-      this.rootElement.innerHTML = ''; // Clear the root element
-      this.rootElement.appendChild(this.currentComponentRef.location.nativeElement);
-    }
-  }
-
-  // Find the matching route
   private _findMatchingRoute(routes: Route[], pathname: string): Route | null {
     for (const route of routes) {
       if (route.path === pathname) {
@@ -269,7 +185,6 @@ export class Router {
     return null;
   }
 
-  // Parse the path and query parameters
   private _parsePath(path: string): {
     pathname: string;
     params: Record<string, string>;
@@ -290,25 +205,21 @@ export class Router {
     return { pathname, params: this.currentParams, query };
   }
 
-  // Navigate to the current URL
   private _navigateToCurrentUrl(): void {
     const currentPath = window.location.pathname + window.location.search;
     this._handleRouting(currentPath);
   }
 
-  // Bind event listeners
   private _bindEvents(): void {
     window.addEventListener('popstate', this._handlePopState);
     document.addEventListener('click', this._handleClick);
   }
 
-  // Handle popstate events
   private _handlePopState(): void {
     const currentPath = window.location.pathname + window.location.search;
     this._handleRouting(currentPath);
   }
 
-  // Handle link clicks
   private _handleClick(e: MouseEvent): void {
     const link = (e.target as HTMLElement).closest('a');
     if (!link) return;
@@ -331,3 +242,51 @@ export class Router {
     }
   }
 }
+
+/*
+// Example usage:
+const routes: Route[] = [
+  {
+    path: '/',
+    loadComponent: () => import('./home-component'),
+  },
+  {
+    path: '/about',
+    loadComponent: () => import('./about-component'),
+    children: [
+      {
+        path: 'team',
+        loadComponent: () => import('./team-component'),
+      },
+    ],
+  },
+  {
+    path: '/users/:id',
+    loadChildren: () => import('./user-module'),
+  },
+  {
+    path: '*',
+    loadComponent: () => import('./not-found-component'),
+  },
+];
+
+const router = new Router({
+  routes,
+  rootElement: document.getElementById('app'),
+  enableTracing: true,
+});
+
+router.start();
+
+// Create navigation programmatically
+const nav = document.createElement('nav');
+nav.appendChild(router.createLink('/', 'Home'));
+nav.appendChild(document.createTextNode(' | '));
+nav.appendChild(router.createLink('/about', 'About'));
+nav.appendChild(document.createTextNode(' | '));
+nav.appendChild(router.createLink('/about/team', 'Team'));
+nav.appendChild(document.createTextNode(' | '));
+nav.appendChild(router.createLink('/users/123', 'User Profile'));
+
+document.body.insertBefore(nav, document.getElementById('app'));
+*/
