@@ -17,7 +17,10 @@ export interface Route {
   data?: Record<string, any>;
   children?: Route[]; // Support for nested routes
   canActivate?: CanActivate[]; // Route guards
+  canDeactivate?: CanDeactivate[]; // Route deactivation guards
+  canLoad?: CanLoad[]; // Lazy loading guards
   resolve?: Record<string, Resolve<any>>; // Resolvers
+  errorComponent?: Type<any>; // Fallback component for errors
 }
 
 export interface RouterConfig {
@@ -35,6 +38,14 @@ export interface ActivatedRoute {
 
 export interface CanActivate {
   canActivate(route: ActivatedRoute): boolean | Promise<boolean>;
+}
+
+export interface CanDeactivate {
+  canDeactivate(route: ActivatedRoute): boolean | Promise<boolean>;
+}
+
+export interface CanLoad {
+  canLoad(route: Route): boolean | Promise<boolean>;
 }
 
 export interface Resolve<T> {
@@ -60,6 +71,13 @@ export class Router {
     private environmentInjector: EnvironmentInjector
   ) {
     this.routes = config.routes;
+
+    // Ensure the wildcard route is the last route
+    const wildcardIndex = this.routes.findIndex((r) => r.path === '*');
+    if (wildcardIndex >= 0 && wildcardIndex !== this.routes.length - 1) {
+      throw new Error('The wildcard route (path: "*") must be the last route in the configuration.');
+    }
+
     this.rootElement = config.rootElement || document.getElementById('app');
     this.enableTracing = config.enableTracing || false;
 
@@ -103,6 +121,13 @@ export class Router {
     return link;
   }
 
+  private _handleRedirect(redirectTo: string, params: Record<string, string>): string {
+    return redirectTo.replace(/:\w+/g, (match) => {
+      const paramName = match.slice(1); // Remove the leading ':'
+      return params[paramName] || match; // Replace with actual value or keep the placeholder
+    });
+  }
+
   // Handle routing logic
   private async _handleRouting(path: string): Promise<void> {
     const { pathname, params, query } = this._parsePath(path);
@@ -132,6 +157,37 @@ export class Router {
         }
       }
 
+      // Check lazy loading guards
+      if (route.canLoad && (route.loadChildren || route.loadComponent)) {
+        const canLoadResults = await Promise.all(
+          route.canLoad.map((guard) => guard.canLoad(route))
+        );
+
+        if (canLoadResults.some((result) => !result)) {
+          // If any guard returns false, block lazy loading
+          return;
+        }
+      }
+
+      // Check deactivation guards
+      if (this.currentComponentRef && route.canDeactivate) {
+        const canDeactivateResults = await Promise.all(
+          route.canDeactivate.map((guard) =>
+            guard.canDeactivate({
+              params: this.currentParams,
+              queryParams: this.currentQuery,
+              path: this.currentPath,
+              data: route.data,
+            })
+          )
+        );
+
+        if (canDeactivateResults.some((result) => !result)) {
+          // If any guard returns false, block navigation
+          return;
+        }
+      }
+
       // Resolve data
       const resolvedData: Record<string, any> = {};
       if (route.resolve) {
@@ -156,37 +212,35 @@ export class Router {
       };
 
       if (route.redirectTo) {
-        this.navigate(route.redirectTo, true);
+        const redirectPath = this._handleRedirect(route.redirectTo, params);
+        this.navigate(redirectPath, true);
         return;
       }
 
-      // Handle Angular module loading
-      if (route.loadChildren) {
-        try {
+      try {
+        // Handle Angular module loading
+        if (route.loadChildren) {
           const module = await route.loadChildren();
           this.currentModuleRef = module;
 
           // Bootstrap the Angular module
           const component = module.instance.ngDoBootstrap();
           if (component) {
-            this._renderAngularComponent(component);
-          }
-        } catch (error) {
-          console.error('Failed to load Angular module:', error);
-          if (this.rootElement) {
-            this.rootElement.innerHTML = '<h1>Angular module failed to load</h1>';
+            this._renderAngularComponent(component, activatedRoute);
           }
         }
-      }
-      // Handle Angular component loading
-      else if (route.loadComponent) {
-        try {
+        // Handle Angular component loading
+        else if (route.loadComponent) {
           const component = await route.loadComponent();
-          this._renderAngularComponent(component);
-        } catch (error) {
-          console.error('Failed to load Angular component:', error);
+          this._renderAngularComponent(component, activatedRoute);
+        }
+      } catch (error) {
+        console.error('Failed to load component/module:', error);
+        if (route.errorComponent) {
+          this._renderAngularComponent(route.errorComponent, activatedRoute);
+        } else {
           if (this.rootElement) {
-            this.rootElement.innerHTML = '<h1>Angular component failed to load</h1>';
+            this.rootElement.innerHTML = '<h1>Failed to load component/module</h1>';
           }
         }
       }
@@ -204,15 +258,25 @@ export class Router {
   }
 
   // Render an Angular component
-  private _renderAngularComponent(component: Type<any>): void {
+  private _renderAngularComponent(component: Type<any>, activatedRoute: ActivatedRoute): void {
+    // Clean up the previous component and module
     if (this.currentComponentRef) {
-      this.currentComponentRef.destroy(); // Clean up the previous component
+      this.currentComponentRef.destroy();
+    }
+    if (this.currentModuleRef) {
+      this.currentModuleRef.destroy(); // Destroy the module reference
+      this.currentModuleRef = null;
     }
 
     // Create the component dynamically
     this.currentComponentRef = createComponent(component, {
       environmentInjector: this.environmentInjector,
     });
+
+    // Pass ActivatedRoute data as input properties
+    if (this.currentComponentRef.instance.routeData) {
+      this.currentComponentRef.instance.routeData = activatedRoute;
+    }
 
     if (this.rootElement) {
       this.rootElement.innerHTML = ''; // Clear the root element
@@ -221,52 +285,33 @@ export class Router {
   }
 
   // Find the matching route
-  private _findMatchingRoute(routes: Route[], pathname: string): Route | null {
+  private _findMatchingRoute(routes: Route[], path: string): Route | null {
+    let bestMatch: Route | null = null;
+    let bestMatchLength = -1;
+
     for (const route of routes) {
-      if (route.path === pathname) {
-        return route;
-      }
+        const regex = this._convertPathToRegex(route.path);
+        const match = path.match(regex);
 
-      if (route.path === '*') {
-        return route;
-      }
+        if (match) {
+            const matchedLength = match[0].length;
 
-      const routeSegments = route.path.split('/').filter(Boolean);
-      const pathSegments = pathname.split('/').filter(Boolean);
-
-      if (routeSegments.length !== pathSegments.length) {
-        continue;
-      }
-
-      let isMatch = true;
-      const params: Record<string, string> = {};
-
-      for (let i = 0; i < routeSegments.length; i++) {
-        const routeSegment = routeSegments[i];
-        const pathSegment = pathSegments[i];
-
-        if (routeSegment.startsWith(':')) {
-          const paramName = routeSegment.slice(1);
-          params[paramName] = pathSegment;
-        } else if (routeSegment !== pathSegment) {
-          isMatch = false;
-          break;
+            if (matchedLength > bestMatchLength) {
+                bestMatch = route;
+                bestMatchLength = matchedLength;
+            }
         }
-      }
-
-      if (isMatch) {
-        this.currentParams = params;
-        if (route.children) {
-          const childRoute = this._findMatchingRoute(route.children, pathname);
-          if (childRoute) {
-            return childRoute;
-          }
-        }
-        return route;
-      }
     }
 
-    return null;
+    return bestMatch ?? routes.find(r => r.path === '*') ?? null;
+}
+
+private _convertPathToRegex(path: string): RegExp {
+    const regexPath = path
+        .replace(/\/:([^/]+)/g, '/([^/]+)')
+        .replace(/\*/g, '.*');
+
+    return new RegExp(`^${regexPath}$`);
   }
 
   // Parse the path and query parameters
@@ -277,7 +322,9 @@ export class Router {
   } {
     const [pathname, queryString] = path.split('?');
     const query: Record<string, string> = {};
+    const params: Record<string, string> = {};
 
+    // Process query parameters
     if (queryString) {
       queryString.split('&').forEach((param) => {
         const [key, value] = param.split('=');
@@ -287,7 +334,37 @@ export class Router {
       });
     }
 
-    return { pathname, params: this.currentParams, query };
+    // Find matching route and extract parameters
+    const route = this._findMatchingRoute(this.routes, pathname);
+    if (route) {
+      this._extractRouteParams(route, pathname, params);
+    }
+
+    return { pathname, params, query };
+  }
+
+  private _extractRouteParams(route: Route, pathname: string, params: Record<string, string>): void {
+    const routeSegments = route.path.split('/').filter(Boolean);
+    const pathSegments = pathname.split('/').filter(Boolean);
+
+    for (let i = 0; i < routeSegments.length && i < pathSegments.length; i++) {
+      const routeSegment = routeSegments[i];
+      const pathSegment = pathSegments[i];
+
+      if (routeSegment.startsWith(':')) {
+        const paramName = routeSegment.slice(1);
+        params[paramName] = pathSegment;
+      }
+    }
+
+    // Recursively extract parameters from child routes
+    if (route.children) {
+      const remainingPath = pathSegments.slice(routeSegments.length).join('/');
+      const childRoute = this._findMatchingRoute(route.children, remainingPath);
+      if (childRoute) {
+        this._extractRouteParams(childRoute, remainingPath, params);
+      }
+    }
   }
 
   // Navigate to the current URL
